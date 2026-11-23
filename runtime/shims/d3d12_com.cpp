@@ -764,6 +764,13 @@ public:
         UINT stride = 0;
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
             return check(false);
+        if (kind == leonida::IndirectKind::dispatch_mesh) {
+            // Not replayed yet: the mesh draws of this call are left out of the frame.
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect with DISPATCH_MESH skipped (not implemented)\n");
+            return;
+        }
         const auto arg_desc = argument_buffer->GetDesc();
         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
             return check(false);

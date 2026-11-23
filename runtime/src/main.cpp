@@ -29,6 +29,8 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "cpu_compat.h"
+#include "probes.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -179,6 +181,29 @@ int wmain(int argc, wchar_t** argv) {
                          "another module's TLS through slot 0, so it is not run\n",
                          main_module.name.c_str(), why.c_str());
             return 1;
+        }
+        // The title uses CLWB to flush write-combined pages. Some host CPUs (e.g. Intel Comet Lake) do not implement
+        // it, so replace it with NOPs before any image code runs.
+        if (init || run) {
+            for (auto* m : loader.modules()) {
+                const auto r = leonida::cpu_compat::patch_clwb(static_cast<uint8_t*>(m->base));
+                if (r.patched)
+                    std::fprintf(stderr, "[rt] cpu_compat: patched %zu CLWB instruction(s) in %s\n", r.patched,
+                                 m->name.c_str());
+                if (!r.ok)
+                    std::fprintf(stderr, "[rt] cpu_compat: %s: %s\n", m->name.c_str(), r.error);
+            }
+        }
+        if (init || run) {
+            auto* main = static_cast<uint8_t*>(main_module.base);
+            leonida::cpu_compat::install_clzero_emulation();
+            leonida::probes::nop_int3s(main);
+            if (const int n = leonida::probes::install(main))
+                std::fprintf(stderr, "[rt] probes: %d placed\n", n);
+            const auto w = leonida::cpu_compat::patch_watchdog_abort(main);
+            if (w.patched)
+                std::fprintf(stderr, "[rt] cpu_compat: neutralized %zu watchdog self-fault(s)\n", w.patched);
+            if (!w.ok) std::fprintf(stderr, "[rt] cpu_compat: watchdog patch: %s\n", w.error);
         }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.

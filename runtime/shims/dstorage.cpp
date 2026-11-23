@@ -31,6 +31,7 @@
 
 #include "dstorage_xs_abi.h"
 #include "shims.h"
+#include "zlib.h"
 
 using namespace dsx;
 
@@ -435,6 +436,53 @@ HRESULT read_file_range(HANDLE handle, uint64_t offset, void* destination, uint3
     return S_OK;
 }
 
+// ---- zlib ---------------------------------------------------------------------------------------------------------
+
+// Inflates `in` into `out`, which must come out exactly `out_size` bytes. The console's decompression unit takes
+// zlib streams; a raw deflate stream (no header) is accepted too, in case a title stores those. The output goes to a
+// scratch buffer first and then to the title's memory with guarded_move, so a bad destination is an error code.
+// The PC header's decompression-error code is not in dstorage_xs_abi.h (unmeasured here), so a failed inflate reports
+// the generic "invalid data" HRESULT.
+const HRESULT kDecompressionFailed = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+
+HRESULT inflate_exact(const uint8_t* in, uint32_t in_size, void* out, uint32_t out_size) {
+    std::unique_ptr<uint8_t[]> scratch(new (std::nothrow) uint8_t[out_size ? out_size : 1]);
+    if (!scratch) return E_OUTOFMEMORY;
+    for (const int window_bits : {15 + 32, -15}) {  // zlib or gzip header, then raw deflate
+        z_stream z{};
+        if (inflateInit2(&z, window_bits) != Z_OK) return E_OUTOFMEMORY;
+        z.next_in = const_cast<Bytef*>(in);
+        z.avail_in = in_size;
+        z.next_out = scratch.get();
+        z.avail_out = out_size;
+        const int rc = inflate(&z, Z_FINISH);
+        const uLong produced = z.total_out;
+        inflateEnd(&z);
+        if (rc == Z_STREAM_END || (rc == Z_BUF_ERROR && produced == out_size && z.avail_out == 0)) {
+            if (produced != out_size) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+            return guarded_move(out, scratch.get(), out_size) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+        }
+        if (rc != Z_DATA_ERROR) return kDecompressionFailed;
+    }
+    return kDecompressionFailed;
+}
+
+// Request kinds seen, for the boot log: the first request of each kind is described once.
+void note_request_kind(uint64_t o, const DSTORAGE_REQUEST& r) {
+    char key[64], line[256];
+    std::snprintf(key, sizeof key, "kind z%d b%llu s%llu", options::zlib(o) ? 1 : 0,
+                  static_cast<unsigned long long>(options::bcpack(o)),
+                  static_cast<unsigned long long>(options::swizzle(o)));
+    std::snprintf(line, sizeof line,
+                  "first request with zlib=%d bcpack=%llu swizzle=%llu (source %u B, destination %u B, "
+                  "intermediate %u B, %s)",
+                  options::zlib(o) ? 1 : 0, static_cast<unsigned long long>(options::bcpack(o)),
+                  static_cast<unsigned long long>(options::swizzle(o)), r.SourceSize, r.DestinationSize,
+                  r.IntermediateSize,
+                  options::source_type(o) == DSTORAGE_REQUEST_SOURCE_MEMORY ? "memory" : "file");
+    log_once(key, line);
+}
+
 // ---- Queues -------------------------------------------------------------------------------------------------------
 
 struct Entry {
@@ -770,16 +818,18 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::zlib(o) || options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "zlib, BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+        note_request_kind(o, r);
+        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
+            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
+        const bool zlib = options::zlib(o);
         if (o & (options::kDestinationPages | options::kSourcePages)) {
             log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
         if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;  // only zlib + BCPack use it
-        if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+        if (!zlib && r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
@@ -794,6 +844,20 @@ private:
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
+        if (zlib) {
+            std::unique_ptr<uint8_t[]> packed;
+            const uint8_t* in = static_cast<const uint8_t*>(r.Source);
+            if (!memory) {
+                packed.reset(new (std::nothrow) uint8_t[r.SourceSize]);
+                if (!packed) return E_OUTOFMEMORY;
+                const HRESULT read = read_file_range(e.file->handle(), r.FileOffset, packed.get(), r.SourceSize);
+                if (FAILED(read)) return read;
+                in = packed.get();
+            }
+            const HRESULT hr = inflate_exact(in, r.SourceSize, r.Destination, r.DestinationSize);
+            if (FAILED(hr)) log_once("zlibfail" + hr_text(hr), "zlib request failed with " + hr_text(hr));
+            return hr;
+        }
         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
         return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
     }

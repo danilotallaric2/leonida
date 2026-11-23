@@ -843,6 +843,31 @@ struct DeviceState {
     }
 
     // The limits apply to this exact combination of format, type, tiling, usage, create flags and pNext format list.
+    // Console render targets and UAVs come in formats some GPUs cannot render to or store to (B4G4R4A4, for one,
+    // on the retail title's boot). When the image is refused with those usages, it is made without them so the
+    // resource exists and can still be sampled and copied: its render-target and UAV views then fail at creation
+    // (null descriptors) and what the title draws into them is lost. Logged once per format.
+    HRESULT check_image_support_relaxed(VkImageCreateInfo& create) const {
+        HRESULT hr = check_image_support(create);
+        constexpr VkImageUsageFlags kDroppable = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        if (hr != E_INVALIDARG || !(create.usage & kDroppable)) return hr;
+        VkImageCreateInfo relaxed = create;
+        relaxed.usage &= ~kDroppable;
+        if (FAILED(check_image_support(relaxed))) return hr;
+        static std::mutex lock;
+        static std::set<int> logged;
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            if (logged.insert(int(create.format)).second)
+                std::fprintf(stderr,
+                             "[rt] d3d12: VkFormat %d cannot be a render target/UAV on this GPU; image made without "
+                             "those usages (its writes are lost)\n",
+                             int(create.format));
+        }
+        create.usage = relaxed.usage;
+        return S_OK;
+    }
+
     HRESULT check_image_support(const VkImageCreateInfo& create) const {
         VkImageFormatProperties limits{};
         VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -948,8 +973,40 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
+        // The retail title makes a 3840x2160 A8_UNORM render target at startup. A8 is sampled through an R8 image
+        // with a swizzle, which a colour attachment cannot have, so it is refused here on the PC rule. To let the
+        // boot go on it is made as a plain R8_UNORM image: same size, its render-target and UAV views stay refused
+        // (null RTV), so what the title draws into it is lost.
+        if (desc.Format == DXGI_FORMAT_A8_UNORM && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            desc.SampleDesc.Count == 1 && !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+            (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+            log_once("A8_UNORM render target or UAV made as R8_UNORM (its writes are not kept); format", desc.Format);
+            return texture_storage_format(DXGI_FORMAT_R8_UNORM, false);
+        }
+        // An sRGB texture with unordered access (the retail title makes 2048x2048 and 2560x1440 R8G8B8A8_UNORM_SRGB
+        // ones at startup): the console allows it, D3D12 on the PC and Vulkan do not (no sRGB storage images). It is
+        // made as its typeless family, a mutable UNORM image: sRGB views sample and render through it, UAV views
+        // write the UNORM bits (no sRGB encoding on those writes).
+        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            DXGI_FORMAT family = DXGI_FORMAT_UNKNOWN;
+            if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) family = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+            else if (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) family = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+            else if (desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB) family = DXGI_FORMAT_B8G8R8X8_TYPELESS;
+            if (family != DXGI_FORMAT_UNKNOWN) {
+                log_once("sRGB texture with UAV made as its typeless family; format", desc.Format);
+                return texture_storage_format(family, false);
+            }
+        }
+        // B5G5R5A1 with unordered access: GPUs without A1R5G5B5 storage get a mutable R16_UINT image (the same
+        // 16-bit texel), as for R9G9B9E5 above. Typed B5G5R5A1 views reinterpret it.
+        if (desc.Format == DXGI_FORMAT_B5G5R5A1_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            !storage_usable(VK_FORMAT_A1R5G5B5_UNORM_PACK16)) {
+            log_once("B5G5R5A1_UNORM UAV unavailable natively, using mutable R16_UINT; format", desc.Format);
+            return {VK_FORMAT_R16_UINT, VK_IMAGE_ASPECT_COLOR_BIT, true};
+        }
         if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
+            ((desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+              desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D) || desc.SampleDesc.Count != 1 ||
              (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
             return {};
@@ -994,10 +1051,11 @@ struct DeviceState {
 
     // The memory an image made from `create` needs, or false if the device can't make that image.
     bool memory_requirements(const VkImageCreateInfo& create, VkMemoryRequirements& out) const {
-        if (FAILED(check_image_support(create))) return false;
+        VkImageCreateInfo checked = create;
+        if (FAILED(check_image_support_relaxed(checked))) return false;
         if (image_requirements) {
             VkDeviceImageMemoryRequirements query{VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS};
-            query.pCreateInfo = &create;
+            query.pCreateInfo = &checked;
             VkMemoryRequirements2 result{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
             image_requirements(info.device, &query, &result);
             out = result.memoryRequirements;
@@ -1005,7 +1063,7 @@ struct DeviceState {
         }
         auto& vk = context->vk;  // without the query, a throwaway image
         VkImage image = VK_NULL_HANDLE;
-        VkImageCreateInfo shared = create;
+        VkImageCreateInfo shared = checked;
         share(shared);
         if (vk.vkCreateImage(info.device, &shared, nullptr, &image) != VK_SUCCESS) return false;
         vk.vkGetImageMemoryRequirements(info.device, image, &out);
@@ -2139,6 +2197,7 @@ public:
             info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
             support = device_.check_image_support(info);
         }
+        if (support == E_INVALIDARG) support = device_.check_image_support_relaxed(info);
         if (FAILED(support)) return support;
         device_.share(info);
         const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
@@ -2224,7 +2283,13 @@ public:
     // Buffers only, as on D3D12; textures have no GPU VA (images are reached through descriptors). An acceleration
     // structure reports its real device address (instance descriptors and builds hand it to the driver); other
     // buffers report their console VA into the GPU address arena.
-    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+    // A texture made in place of a console placement at a VA reports that VA (set_console_va): the console code
+    // turns it into a CPU pointer to the title's pages.
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        if (accel_) return gpu_va_;
+        return va_ ? va_ : console_va_;
+    }
+    void set_console_va(std::uint64_t va) { console_va_ = va; }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -2531,6 +2596,7 @@ private:
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     bool reserved_ = false;
+    std::uint64_t console_va_ = 0;  // set_console_va
     bool sparse_image_ = false;
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
@@ -4885,6 +4951,9 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_console_texture_va_handler([](ID3D12Resource* resource, std::uint64_t va) {
+            if (auto* object = Resource::from<Resource>(resource)) object->set_console_va(va);
+        });
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -5678,6 +5747,9 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        // The title creates a DISPATCH_MESH signature during device init and aborts if it fails. It is accepted so
+        // init goes on; ExecuteIndirect skips it (d3d12_com.cpp) until mesh indirect replay exists.
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: kind = leonida::IndirectKind::dispatch_mesh; break;
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());

@@ -150,6 +150,11 @@ ID3D12Device* device_proxy_real_device(const void* device);
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, REFIID riid,
                                       void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
+// A texture the title places at a VA (slot 133) is made committed, apart from the title's pages; the console code
+// still turns its GetGPUVirtualAddress into a CPU pointer to those pages. The backend registers this hook so such a
+// texture reports the VA it was placed at.
+using ConsoleTextureVaHandler = void (*)(ID3D12Resource* resource, std::uint64_t va);
+void set_console_texture_va_handler(ConsoleTextureVaHandler handler);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14 (descriptor heap proxy), 17-24 (CPU descriptor handle translation), 26 (the
