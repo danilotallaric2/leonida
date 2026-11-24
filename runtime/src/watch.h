@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <intrin.h>
+#include <unordered_map>
 
 namespace leonida::watch {
 
@@ -123,13 +124,95 @@ inline void log_call(const char* op, const void* p, std::uint64_t size, void* re
     std::fflush(stderr);
 }
 
+// LEONIDA_WATCH_ALLOC_CALLER="rva" (hex): every block allocated from that return address is remembered, and its free
+// is logged with the caller chain (first 40), whatever the address.
+inline std::uint64_t g_track_caller = 0;
+inline SRWLOCK g_track_lock = SRWLOCK_INIT;
+inline void* g_tracked[4096];
+inline int g_tracked_count = 0;
+inline std::atomic<int> g_tracked_frees{0};
+struct Freed {
+    void* ptr = nullptr;
+    std::uint64_t rets[16]{};
+    int count = 0;
+};
+inline Freed g_freed[4096];
+inline unsigned g_freed_next = 0;
+inline std::unordered_map<void*, unsigned>* g_freed_index = new std::unordered_map<void*, unsigned>;
+
 inline void* __fastcall alloc_hook(void* self, void* a, std::uint64_t size, void* b, void* c, void* d) {
     void* p = g_alloc(self, a, size, b, c, d);
+    if (p && g_track_caller &&
+        reinterpret_cast<std::uint64_t>(_ReturnAddress()) == reinterpret_cast<std::uint64_t>(state().image) + g_track_caller) {
+        AcquireSRWLockExclusive(&g_track_lock);
+        if (g_tracked_count < 4096) g_tracked[g_tracked_count++] = p;
+        ReleaseSRWLockExclusive(&g_track_lock);
+    }
+    if (p && g_track_caller) {  // any reuse of a freed block ends its "recently freed" record
+        AcquireSRWLockShared(&g_track_lock);
+        const bool known = g_freed_index->count(p) != 0;
+        ReleaseSRWLockShared(&g_track_lock);
+        if (known) {
+            AcquireSRWLockExclusive(&g_track_lock);
+            auto it = g_freed_index->find(p);
+            if (it != g_freed_index->end()) {
+                g_freed[it->second].ptr = nullptr;
+                g_freed_index->erase(it);
+            }
+            ReleaseSRWLockExclusive(&g_track_lock);
+        }
+    }
     if (p && near_watch(p)) log_call("alloc", p, size, _ReturnAddress(), static_cast<void* const*>(_AddressOfReturnAddress()));
     return p;
 }
 
 inline void __fastcall free_hook(void* self, void* p, void* b, void* c) {
+    if (p && g_track_caller) {
+        bool tracked = false;
+        AcquireSRWLockExclusive(&g_track_lock);
+        for (int i = 0; i < g_tracked_count; ++i)
+            if (g_tracked[i] == p) {
+                g_tracked[i] = g_tracked[--g_tracked_count];
+                tracked = true;
+                break;
+            }
+        ReleaseSRWLockExclusive(&g_track_lock);
+        auto* const* frame = static_cast<void* const*>(_AddressOfReturnAddress());
+        if (tracked) {  // remember who freed it
+            AcquireSRWLockExclusive(&g_track_lock);
+            const unsigned slot = g_freed_next++ % 4096;
+            Freed& f = g_freed[slot];
+            if (f.ptr) g_freed_index->erase(f.ptr);
+            f.ptr = p;
+            (*g_freed_index)[p] = slot;
+            int n = 0;
+            for (int i = 0; i < 200 && n < 16; ++i) {
+                const auto v = reinterpret_cast<std::uint64_t>(frame[i]);
+                if (v >= reinterpret_cast<std::uint64_t>(state().image) + 0x1000 &&
+                    v < reinterpret_cast<std::uint64_t>(state().image) + 0x5f40000)
+                    f.rets[n++] = v - reinterpret_cast<std::uint64_t>(state().image);
+            }
+            f.count = n;
+            ReleaseSRWLockExclusive(&g_track_lock);
+        } else {
+            Freed previous{};
+            AcquireSRWLockExclusive(&g_track_lock);
+            auto it = g_freed_index->find(p);
+            if (it != g_freed_index->end()) {
+                previous = g_freed[it->second];
+                g_freed[it->second].ptr = nullptr;
+                g_freed_index->erase(it);
+            }
+            ReleaseSRWLockExclusive(&g_track_lock);
+            if (previous.ptr && g_tracked_frees.fetch_add(1) < 8) {
+                std::fprintf(stderr, "[watch] DOUBLE FREE of %p; first free chain:", p);
+                for (int i = 0; i < previous.count; ++i)
+                    std::fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(previous.rets[i]));
+                std::fprintf(stderr, "\n");
+                log_call("second free", p, 0, _ReturnAddress(), frame);
+            }
+        }
+    }
     if (p && near_watch(p)) log_call("free ", p, 0, _ReturnAddress(), static_cast<void* const*>(_AddressOfReturnAddress()));
     g_free(self, p, b, c);
 }
@@ -163,6 +246,9 @@ inline void configure(std::uint8_t* image, std::size_t image_size) {
     s.image = image, s.image_size = image_size;
     s.configured = true;
     AddVectoredExceptionHandler(1, handler);
+    char caller[32];
+    if (getenv_s(&length, caller, sizeof caller, "LEONIDA_WATCH_ALLOC_CALLER") == 0 && length > 1)
+        g_track_caller = std::strtoull(caller, nullptr, 16);
     char global[32];
     if (getenv_s(&length, global, sizeof global, "LEONIDA_WATCH_ALLOC") == 0 && length > 1) {
         void* va = reinterpret_cast<void*>(std::strtoull(global, nullptr, 16));
