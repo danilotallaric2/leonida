@@ -199,6 +199,11 @@ int wmain(int argc, wchar_t** argv) {
         if (init || run) {
             auto* main = static_cast<uint8_t*>(main_module.base);
             leonida::cpu_compat::install_clzero_emulation();
+            {
+                const auto z = leonida::cpu_compat::patch_clzero_routine(main);
+                std::fprintf(stderr, "[rt] cpu_compat: native work-area clear (CLZERO routine): %s\n",
+                             z.ok ? "patched" : z.error);
+            }
             leonida::probes::nop_int3s(main);
             leonida::probes::install_fault_dumps(main);
             leonida::watch::configure(main, main_module.size);

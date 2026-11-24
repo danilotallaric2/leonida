@@ -213,4 +213,33 @@ inline void install_clzero_emulation() {
     std::fprintf(stderr, "[rt] cpu_compat: CPU lacks CLZERO/MWAITX; emulation installed\n");
 }
 
+// The retail title's only CLZERO user (RVA 0x4e8aa10, game_scarlett_master.exe 1.0.2.1) clears an object's work area:
+// the cache lines of [obj+0x40, obj+0x7440), two 32-byte blocks at +0xda40 and +0xdac0, then stores 0xffffffffff at
+// +0x20. It is called often enough that the per-call CLZERO faults (emulated in clzero_handler) dominated the boot
+// on a CPU without CLZERO. The function is replaced by this native one when its first bytes match.
+inline void __fastcall native_clear_work_area(std::uint8_t* o) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(o + 0x40) & ~std::uintptr_t{63};
+    const auto end = ((reinterpret_cast<std::uintptr_t>(o + 0x7440) - 1) | 63) + 1;
+    std::memset(reinterpret_cast<void*>(begin), 0, end - begin);
+    std::memset(o + 0xda40, 0, 32);
+    std::memset(o + 0xdac0, 0, 32);
+    const std::uint64_t marker = 0xffffffffffull;
+    std::memcpy(o + 0x20, &marker, sizeof marker);
+}
+
+inline PatchResult patch_clzero_routine(uint8_t* base) {
+    PatchResult r;
+    constexpr std::uint32_t kRva = 0x4e8aa10;
+    static constexpr std::uint8_t kExpected[] = {0x48, 0x8d, 0x41, 0x40, 0x4c, 0x8d, 0x91, 0xc0, 0x39, 0x00, 0x00,
+                                                 0x4c, 0x8d, 0x89, 0x40, 0x55, 0x00, 0x00};
+    if (!base) return r.error = "no image", r;
+    if (std::memcmp(base + kRva, kExpected, sizeof kExpected) != 0) return r.error = "routine not found", r;
+    std::uint8_t jump[12] = {0x48, 0xB8};  // mov rax, imm64 ; jmp rax
+    const auto target = reinterpret_cast<std::uint64_t>(&native_clear_work_area);
+    std::memcpy(jump + 2, &target, 8);
+    jump[10] = 0xFF;
+    jump[11] = 0xE0;
+    return patch_rva(base, kRva, jump, sizeof jump);
+}
+
 }  // namespace leonida::cpu_compat
