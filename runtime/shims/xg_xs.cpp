@@ -1,5 +1,5 @@
 // xg_xs.dll: the console texture layout library. XGCreateTextureComputer is answered with a computer object whose
-// layout is LINEAR and tightly packed, not the console's swizzled one. It exists so the boot can go on; texture data
+// layout is LINEAR (padded rows and mips, see compute()), not the console's swizzled one. It exists so the boot can go on; texture data
 // written through CopyIntoSubresource lands in linear order and will look wrong wherever the GPU side expects the
 // console swizzle.
 //
@@ -27,6 +27,7 @@
 #include <utility>
 
 #include "shims.h"
+#include "../src/feature_off.h"
 
 namespace {
 
@@ -111,12 +112,15 @@ struct Computer {
             p.depth = volume ? std::max<std::uint32_t>(desc.DepthOrArraySize >> m, 1) : 1;
             p.cols = (p.width + fmt.block_dim - 1) / fmt.block_dim;
             p.rows = (p.height + fmt.block_dim - 1) / fmt.block_dim;
-            p.pitch = p.cols * fmt.block_bytes;
-            p.slice = std::uint64_t(p.pitch) * p.rows * p.depth;
+            // Padded, not tight: a console layout is never smaller than this (tile-aligned rows, at least one 4 KB
+            // tile per mip, 64 KB total), and a title that sizes a buffer from this layout but fills it by its own
+            // rules must not run past the end. Rows 256-byte aligned, slices 4 KB aligned.
+            p.pitch = (p.cols * fmt.block_bytes + 255u) & ~255u;
+            p.slice = (std::uint64_t(p.pitch) * p.rows * p.depth + 4095u) & ~std::uint64_t{4095};
             p.offset = at;
             at += p.slice * array;
         }
-        size = at;
+        size = (at + kTile - 1) & ~(kTile - 1);
     }
 };
 
@@ -183,6 +187,8 @@ HRESULT STDMETHODCALLTYPE copy_into(Computer* self, std::uint8_t* dst, std::uint
                                     const std::uint8_t* src, std::uint32_t row_pitch, std::uint32_t slice_pitch) {
     note_first(8, reinterpret_cast<std::uint64_t>(dst), sub, reinterpret_cast<std::uint64_t>(src));
     if (!dst || !src || plane != 0) return E_INVALIDARG;
+    static const bool off = leonida::feature_off("xgcopy");
+    if (off) return S_OK;
     const std::uint32_t m = sub % self->mips, slice = sub / self->mips;
     if (slice >= self->array) return E_INVALIDARG;
     const Mip& p = self->mip[m];

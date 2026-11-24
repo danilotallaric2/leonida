@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "shims.h"
+#include "../src/watch.h"
 #include "startup_trace.h"
 
 namespace {
@@ -64,11 +65,26 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
+// LEONIDA_XMEM_LOG=1: every XMemVirtualAlloc of 1 MiB or more goes to stderr with the address it returned, so an
+// address seen in a crash can be traced back to its reservation.
+bool xmem_log_enabled() {
+    static const bool on = [] {
+        char v[4];
+        size_t n = 0;
+        return getenv_s(&n, v, sizeof v, "LEONIDA_XMEM_LOG") == 0 && n > 1 && v[0] == '1';
+    }();
+    return on;
+}
+
 void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    void* p = allocate_block(size);
+    if (xmem_log_enabled() && size >= (1u << 20))
+        std::fprintf(stderr, "[rt] xmem: XMemAlloc(0x%zx, attr 0x%llx) -> %p\n", size,
+                     static_cast<unsigned long long>(attributes), p);
+    return p;
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
@@ -320,8 +336,9 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+void* xmem_virtual_alloc_impl(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect,
+                               void* caller) {
+    note_attributes("XMemVirtualAlloc", attributes, size, caller);
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -423,6 +440,16 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                                                 &parameter, 1);
     }
     return VirtualAlloc(address, size, host_type, host_prot);
+}
+
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+    void* result = xmem_virtual_alloc_impl(address, size, allocation_type, attributes, protect, _ReturnAddress());
+    leonida::watch::on_reservation(result, size, attributes);
+    if (xmem_log_enabled() && size >= (1u << 20))
+        std::fprintf(stderr, "[rt] xmem: XMemVirtualAlloc(%p, 0x%zx, type 0x%lx, attr 0x%llx) -> %p [%p..%p)\n",
+                     address, static_cast<size_t>(size), allocation_type, static_cast<unsigned long long>(attributes),
+                     result, result, result ? static_cast<char*>(result) + size : nullptr);
+    return result;
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.

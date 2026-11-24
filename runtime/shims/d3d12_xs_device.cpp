@@ -27,6 +27,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
+#include "../src/feature_off.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -2825,6 +2826,8 @@ std::atomic<ConsoleTextureVaHandler> g_console_texture_va{nullptr};
 // Hands a texture made for a console placement at `va` to the backend hook, so it reports that VA.
 void note_console_texture_va(const D3D12_RESOURCE_DESC* desc, std::uint64_t va, void** out) {
     if (!desc || desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || !va || !out || !*out) return;
+    static const bool off = leonida::feature_off("consoleva");
+    if (off) return;
     const auto handler = g_console_texture_va.load(std::memory_order_acquire);
     if (!handler) return;
     ID3D12Resource* resource = nullptr;
@@ -3361,7 +3364,8 @@ void* WINAPI proxy_get_resource_allocation_info_x108(std::uint64_t a0, std::uint
     if (!logged.exchange(true, std::memory_order_relaxed))
         std::fprintf(stderr, "[rt] d3d12_xs: device slot 108 (Xbox GetResourceAllocationInfo1 form) first call\n");
     void* const ret = proxy_get_resource_allocation_info(a0, a1, visible_mask, count, descs);
-    if (each && descs) {
+    static const bool each_off = leonida::feature_off("x108each");
+    if (each && descs && !each_off) {
         std::uint64_t offset = 0;
         for (std::uint64_t i = 0; i < count; ++i) {
             D3D12_RESOURCE_ALLOCATION_INFO one{};

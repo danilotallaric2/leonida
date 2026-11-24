@@ -24,6 +24,7 @@
 #include <set>
 
 #include "shims.h"
+#include "../src/feature_off.h"
 
 namespace {
 
@@ -193,6 +194,8 @@ HRESULT WINAPI xapu_connect(const std::uint32_t* config, void** out16, void** ha
 
 HRESULT WINAPI xapu_enqueue_command(void*, const std::uint8_t* cmd, std::uint64_t) {
     if (!cmd) return E_POINTER;
+    static const bool echo = !leonida::feature_off("xapu_echo");
+    if (!echo) return S_OK;
     ApuResult r{};
     std::memcpy(r.bytes, cmd, 8);  // +0 type (= the opcode), +4 slot; +0x34 output size stays 0
     std::lock_guard<std::mutex> guard(g_xapu.lock);

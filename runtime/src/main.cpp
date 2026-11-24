@@ -31,6 +31,7 @@
 #include "code_hooks.h"
 #include "cpu_compat.h"
 #include "probes.h"
+#include "watch.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -198,6 +199,8 @@ int wmain(int argc, wchar_t** argv) {
             auto* main = static_cast<uint8_t*>(main_module.base);
             leonida::cpu_compat::install_clzero_emulation();
             leonida::probes::nop_int3s(main);
+            leonida::probes::install_fault_dumps(main);
+            leonida::watch::configure(main, main_module.size);
             if (const int n = leonida::probes::install(main))
                 std::fprintf(stderr, "[rt] probes: %d placed\n", n);
             const auto w = leonida::cpu_compat::patch_watchdog_abort(main);

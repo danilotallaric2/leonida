@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,62 @@ inline void write_byte(uint8_t* p, uint8_t v) {
     DWORD ignored = 0;
     VirtualProtect(p, 1, old, &ignored);
     FlushInstructionCache(GetCurrentProcess(), p, 1);
+}
+
+inline uint32_t g_fault_rvas[32];
+inline int g_fault_count = 0;
+
+inline void dump_context(const char* tag, uint64_t rva, CONTEXT* c) {
+    const auto* sp = reinterpret_cast<const uint64_t*>(c->Rsp);
+    std::fprintf(stderr,
+                 "[%s] +0x%llx tid=%lu rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx "
+                 "r12=%llx r13=%llx r14=%llx r15=%llx rbp=%llx rsp=%llx [rsp]=%llx %llx %llx %llx\n",
+                 tag, static_cast<unsigned long long>(rva), GetCurrentThreadId(), c->Rax, c->Rbx, c->Rcx, c->Rdx,
+                 c->Rsi, c->Rdi, c->R8, c->R9, c->R12, c->R13, c->R14, c->R15, c->Rbp, c->Rsp, sp[0], sp[1], sp[2],
+                 sp[3]);
+    const struct { const char* name; DWORD64 value; } regs[] = {{"rax", c->Rax}, {"rcx", c->Rcx}, {"rdx", c->Rdx},
+                                                                 {"rsi", c->Rsi}, {"rdi", c->Rdi}, {"r14", c->R14},
+                                                                 {"r15", c->R15}};
+    for (const auto& r : regs) {
+        const auto* at = reinterpret_cast<const uint8_t*>(r.value) - 16;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (r.value < 0x10000 || !VirtualQuery(at, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            reinterpret_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize < at + 64)
+            continue;
+        std::fprintf(stderr, "[%s]   %s-16:", tag, r.name);
+        for (int i = 0; i < 64; ++i) std::fprintf(stderr, "%s%02x", i == 16 ? " | " : " ", at[i]);
+        std::fprintf(stderr, "  (alloc base %p)\n", mbi.AllocationBase);
+    }
+    std::fflush(stderr);
+}
+
+// LEONIDA_FAULTS="rva[,rva...]": any exception raised at one of these RVAs of the main image dumps the context once
+// per RVA, then goes on to the normal handling.
+inline LONG CALLBACK fault_handler(EXCEPTION_POINTERS* info) {
+    const auto rip = reinterpret_cast<uint8_t*>(info->ContextRecord->Rip);
+    if (!g_base || rip < g_base) return EXCEPTION_CONTINUE_SEARCH;
+    const uint64_t rva = static_cast<uint64_t>(rip - g_base);
+    static std::atomic<uint32_t> dumped{0};
+    for (int i = 0; i < g_fault_count; ++i) {
+        if (g_fault_rvas[i] != rva) continue;
+        if (dumped.fetch_or(1u << i) & (1u << i)) return EXCEPTION_CONTINUE_SEARCH;
+        std::fprintf(stderr, "[fault] code 0x%08lx at +0x%llx\n", info->ExceptionRecord->ExceptionCode,
+                     static_cast<unsigned long long>(rva));
+        dump_context("fault", rva, info->ContextRecord);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+inline void install_fault_dumps(uint8_t* base) {
+    char spec[512];
+    size_t length = 0;
+    if (getenv_s(&length, spec, sizeof spec, "LEONIDA_FAULTS") != 0 || length <= 1) return;
+    g_base = base;
+    for (char* tok = std::strtok(spec, ", "); tok && g_fault_count < 32; tok = std::strtok(nullptr, ", "))
+        g_fault_rvas[g_fault_count++] = static_cast<uint32_t>(std::strtoull(tok, nullptr, 16));
+    AddVectoredExceptionHandler(1, fault_handler);
+    std::fprintf(stderr, "[rt] faults: dumping %d address(es)\n", g_fault_count);
 }
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
