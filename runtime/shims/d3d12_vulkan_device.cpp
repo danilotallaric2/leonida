@@ -2327,6 +2327,20 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        // A texture made in place of a console placement at a VA (set_console_va): on the console all memory is CPU
+        // mapped and the retail title maps such textures to fill them, then adds its own subresource offsets. It
+        // gets the title's own pages at that VA; what it writes there does not reach this image (it is an ordinary
+        // committed image), but the title does not take its failure path (which frees the texture object and then
+        // keeps using it: the RT-5 double free / use after free).
+        if (image_ && console_va_ && !cpu_visible()) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed))
+                std::fprintf(stderr,
+                             "[rt] d3d12: Map of a console-placed texture answered with its VA (writes do not "
+                             "reach the image)\n");
+            if (data) *data = reinterpret_cast<void*>(console_va_);
+            return S_OK;
+        }
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
