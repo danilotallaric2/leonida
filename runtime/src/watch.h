@@ -50,6 +50,22 @@ inline void print_address(const char* label, std::uint64_t a) {
         std::fprintf(stderr, " %s=+0x%llx", label, static_cast<unsigned long long>(a - reinterpret_cast<std::uint64_t>(s.image)));
 }
 
+// LEONIDA_WATCH_ALLOC_CALLER="rva" (hex): every block allocated from that return address is remembered, and its free
+// is logged with the caller chain (first 40), whatever the address.
+inline std::uint64_t g_track_caller = 0;
+inline SRWLOCK g_track_lock = SRWLOCK_INIT;
+inline void* g_tracked[4096];
+inline int g_tracked_count = 0;
+inline std::atomic<int> g_tracked_frees{0};
+struct Freed {
+    void* ptr = nullptr;
+    std::uint64_t rets[16]{};
+    int count = 0;
+};
+inline Freed g_freed[4096];
+inline unsigned g_freed_next = 0;
+inline std::unordered_map<void*, unsigned>* g_freed_index = new std::unordered_map<void*, unsigned>;
+
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     State& s = state();
     if (!s.page) return EXCEPTION_CONTINUE_SEARCH;
@@ -59,6 +75,27 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         t_stepping = false;
         reprotect();
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code == EXCEPTION_ACCESS_VIOLATION && g_track_caller) {
+        // A use after free: is one of the object registers a tracked block that was freed? Reported once.
+        static std::atomic<bool> reported{false};
+        const DWORD64 regs[] = {c->Rsi, c->Rcx, c->Rdi, c->Rbx, c->Rdx, c->R12, c->R13, c->R14, c->R15};
+        for (const DWORD64 r : regs) {
+            AcquireSRWLockShared(&g_track_lock);
+            auto it = g_freed_index->find(reinterpret_cast<void*>(r));
+            Freed f{};
+            if (it != g_freed_index->end()) f = g_freed[it->second];
+            ReleaseSRWLockShared(&g_track_lock);
+            if (f.ptr && !reported.exchange(true)) {
+                std::fprintf(stderr, "[watch] USE AFTER FREE of %p at", f.ptr);
+                print_address("rip", c->Rip);
+                std::fprintf(stderr, "; it was freed by:");
+                for (int i = 0; i < f.count; ++i)
+                    std::fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(f.rets[i]));
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
+        }
     }
     if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 ||
         info->ExceptionRecord->ExceptionInformation[0] != 1)
@@ -123,22 +160,6 @@ inline void log_call(const char* op, const void* p, std::uint64_t size, void* re
     std::fprintf(stderr, "\n");
     std::fflush(stderr);
 }
-
-// LEONIDA_WATCH_ALLOC_CALLER="rva" (hex): every block allocated from that return address is remembered, and its free
-// is logged with the caller chain (first 40), whatever the address.
-inline std::uint64_t g_track_caller = 0;
-inline SRWLOCK g_track_lock = SRWLOCK_INIT;
-inline void* g_tracked[4096];
-inline int g_tracked_count = 0;
-inline std::atomic<int> g_tracked_frees{0};
-struct Freed {
-    void* ptr = nullptr;
-    std::uint64_t rets[16]{};
-    int count = 0;
-};
-inline Freed g_freed[4096];
-inline unsigned g_freed_next = 0;
-inline std::unordered_map<void*, unsigned>* g_freed_index = new std::unordered_map<void*, unsigned>;
 
 inline void* __fastcall alloc_hook(void* self, void* a, std::uint64_t size, void* b, void* c, void* d) {
     void* p = g_alloc(self, a, size, b, c, d);
