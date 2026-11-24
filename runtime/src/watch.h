@@ -105,22 +105,32 @@ inline bool near_watch(const void* p) {
     return s.lo && b + 0x400 >= s.lo && b <= s.hi + 0x400;
 }
 
-inline void log_call(const char* op, const void* p, std::uint64_t size, void* ret) {
+inline void log_call(const char* op, const void* p, std::uint64_t size, void* ret, void* const* frame) {
     std::fprintf(stderr, "[watch] %s %p size 0x%llx tid=%lu", op, p, static_cast<unsigned long long>(size),
                  GetCurrentThreadId());
     print_address("caller", reinterpret_cast<std::uint64_t>(ret));
+    int shown = 0;
+    for (int i = 1; i < 160 && shown < 14; ++i) {  // return-address candidates further up the stack
+        const auto v = reinterpret_cast<std::uint64_t>(frame[i]);
+        State& s = state();
+        if (s.image && v >= reinterpret_cast<std::uint64_t>(s.image) + 0x1000 &&
+            v < reinterpret_cast<std::uint64_t>(s.image) + 0x5f40000) {
+            print_address("up", v);
+            ++shown;
+        }
+    }
     std::fprintf(stderr, "\n");
     std::fflush(stderr);
 }
 
 inline void* __fastcall alloc_hook(void* self, void* a, std::uint64_t size, void* b, void* c, void* d) {
     void* p = g_alloc(self, a, size, b, c, d);
-    if (p && near_watch(p)) log_call("alloc", p, size, _ReturnAddress());
+    if (p && near_watch(p)) log_call("alloc", p, size, _ReturnAddress(), static_cast<void* const*>(_AddressOfReturnAddress()));
     return p;
 }
 
 inline void __fastcall free_hook(void* self, void* p, void* b, void* c) {
-    if (p && near_watch(p)) log_call("free ", p, 0, _ReturnAddress());
+    if (p && near_watch(p)) log_call("free ", p, 0, _ReturnAddress(), static_cast<void* const*>(_AddressOfReturnAddress()));
     g_free(self, p, b, c);
 }
 
